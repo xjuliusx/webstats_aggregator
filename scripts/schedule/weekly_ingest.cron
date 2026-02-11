@@ -1,0 +1,1 @@
+0 8 * * * cd /Users/juliuskim/projects/webstats_aggregator/webstats_aggregator && /usr/bin/python3 scripts/collection/weekly_goatcounter_to_duckdb.py --once-per-week >> output/weekly_ingest.log 2>&1

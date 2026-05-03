@@ -1,10 +1,19 @@
 #!/usr/bin/env python3
 import argparse
+import io
 import os
+import smtplib
+from email.mime.image import MIMEImage
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import duckdb
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 import pandas as pd
 import requests
 
@@ -21,6 +30,10 @@ BOOTSTRAP_DAYS = 30
 OVERLAP_DAYS = 7
 URL = f"https://{SITE}/api/v0/stats/hits"
 JOB_NAME = "weekly_goatcounter_to_duckdb"
+
+NOTIFY_EMAIL = os.getenv("NOTIFY_EMAIL", "juliuskim@gmail.com")
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
 
 
 def ensure_schema(con: duckdb.DuckDBPyConnection) -> None:
@@ -172,6 +185,60 @@ def upsert_daily_hits(con: duckdb.DuckDBPyConnection, df: pd.DataFrame) -> int:
     return len(df)
 
 
+SITE_LAUNCH_DATE = date(2026, 4, 24)
+
+
+def build_trend_chart(con: duckdb.DuckDBPyConnection) -> bytes:
+    df = con.execute(
+        """
+        SELECT date, SUM(hits) AS hits
+        FROM goatcounter_daily_hits
+        WHERE event = FALSE AND date >= ?
+        GROUP BY date ORDER BY date
+        """,
+        [SITE_LAUNCH_DATE],
+    ).df()
+    df["date"] = pd.to_datetime(df["date"])
+
+    fig, ax = plt.subplots(figsize=(10, 3))
+    ax.fill_between(df["date"], df["hits"], alpha=0.2, color="#4A90D9")
+    ax.plot(df["date"], df["hits"], color="#4A90D9", linewidth=1.5)
+    ax.set_title("Total Daily Page Views", fontsize=13, pad=10)
+    ax.set_ylabel("Hits")
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
+    ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+    fig.autofmt_xdate()
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.grid(axis="y", linestyle="--", alpha=0.4)
+    plt.tight_layout()
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=150)
+    plt.close(fig)
+    return buf.getvalue()
+
+
+def send_notification(subject: str, body: str, chart_png: bytes = None) -> None:
+    if not SMTP_USER or not SMTP_PASSWORD:
+        return
+    if chart_png:
+        msg = MIMEMultipart("related")
+        msg.attach(MIMEText(body, "html"))
+        img = MIMEImage(chart_png, "png")
+        img.add_header("Content-ID", "<trend_chart>")
+        img.add_header("Content-Disposition", "inline", filename="trend.png")
+        msg.attach(img)
+    else:
+        msg = MIMEText(body, "html")
+    msg["Subject"] = subject
+    msg["From"] = SMTP_USER
+    msg["To"] = NOTIFY_EMAIL
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+        smtp.login(SMTP_USER, SMTP_PASSWORD)
+        smtp.sendmail(SMTP_USER, NOTIFY_EMAIL, msg.as_string())
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -198,26 +265,123 @@ def main() -> None:
         con.close()
         return
 
-    start_date = compute_start_date(con)
-    rows = fetch_hits(start_date)
-    df = flatten_hits(rows)
-    upserted = upsert_daily_hits(con, df)
+    try:
+        start_date = compute_start_date(con)
+        rows = fetch_hits(start_date)
+        df = flatten_hits(rows)
+        upserted = upsert_daily_hits(con, df)
 
-    total_rows = con.execute("SELECT COUNT(*) FROM goatcounter_daily_hits").fetchone()[0]
-    max_date = con.execute("SELECT MAX(date) FROM goatcounter_daily_hits").fetchone()[0]
-    log_run(
-        con,
-        this_week_start,
-        "success",
-        f"payload_rows={len(rows)}, upserted_rows={upserted}, latest_date={max_date}",
-    )
-    con.close()
+        total_rows = con.execute("SELECT COUNT(*) FROM goatcounter_daily_hits").fetchone()[0]
+        max_date = con.execute("SELECT MAX(date) FROM goatcounter_daily_hits").fetchone()[0]
 
-    print(f"Start date: {start_date.isoformat()}")
-    print(f"Rows from GoatCounter payload: {len(rows)}")
-    print(f"Rows upserted into goatcounter_daily_hits: {upserted}")
-    print(f"Total rows in goatcounter_daily_hits: {total_rows}")
-    print(f"Latest date in table: {max_date}")
+        def query_metrics(con, date_filter, params):
+            summary = con.execute(
+                f"""
+                SELECT SUM(hits), COUNT(DISTINCT url)
+                FROM goatcounter_daily_hits
+                WHERE {date_filter} AND event = FALSE
+                """,
+                params,
+            ).fetchone()
+            pages = con.execute(
+                f"""
+                SELECT url, SUM(hits) AS hits
+                FROM goatcounter_daily_hits
+                WHERE {date_filter} AND event = FALSE
+                GROUP BY url ORDER BY hits DESC
+                """,
+                params,
+            ).fetchall()
+            clicks = con.execute(
+                f"""
+                SELECT
+                  CASE WHEN url LIKE 'click-%' THEN SUBSTR(url, 7) ELSE url END AS label,
+                  SUM(hits) AS hits
+                FROM goatcounter_daily_hits
+                WHERE {date_filter} AND event = TRUE
+                GROUP BY label ORDER BY hits DESC
+                """,
+                params,
+            ).fetchall()
+            return summary, pages, clicks
+
+        # This import metrics
+        this_import, this_import_pages, this_import_clicks = query_metrics(con, "date >= ?", [start_date])
+
+        # Month metrics
+        month_start = max_date.replace(day=1)
+        month, month_pages, month_clicks = query_metrics(con, "date >= ?", [month_start])
+
+        # All time metrics
+        alltime_row = con.execute(
+            "SELECT SUM(hits), COUNT(DISTINCT url), MIN(date), MAX(date) FROM goatcounter_daily_hits WHERE event = FALSE"
+        ).fetchone()
+        _, alltime_pages, alltime_clicks = query_metrics(con, "TRUE", [])
+
+        chart_b64 = build_trend_chart(con)
+
+        log_run(
+            con,
+            this_week_start,
+            "success",
+            f"payload_rows={len(rows)}, upserted_rows={upserted}, latest_date={max_date}",
+        )
+        con.close()
+
+        def html_table(page_rows):
+            if not page_rows:
+                return "<p><em>(none)</em></p>"
+            rows_html = "".join(
+                f"<tr><td>{url}</td><td style='text-align:right'>{hits:,}</td></tr>"
+                for url, hits in page_rows
+            )
+            return (
+                "<table style='border-collapse:collapse;font-family:monospace;font-size:13px'>"
+                "<thead><tr>"
+                "<th style='text-align:left;padding:4px 16px 4px 0;border-bottom:2px solid #ccc'>Page</th>"
+                "<th style='text-align:right;padding:4px 0;border-bottom:2px solid #ccc'>Hits</th>"
+                "</tr></thead>"
+                f"<tbody>{rows_html}</tbody>"
+                "</table>"
+            )
+
+        def section(title, summary, page_rows, click_rows):
+            return (
+                f"<h3 style='margin-bottom:4px'>{title}</h3>"
+                f"<p style='margin:0 0 8px'>Page views: <strong>{summary[0] or 0:,}</strong> &nbsp;|&nbsp; "
+                f"Unique pages: <strong>{summary[1] or 0:,}</strong></p>"
+                f"<p style='margin:4px 0 4px'><strong>Page Views</strong></p>"
+                f"{html_table(page_rows)}"
+                f"<p style='margin:12px 0 4px'><strong>Click Navigations</strong></p>"
+                f"{html_table(click_rows)}"
+            )
+
+        subject = f"webstats ingest: {start_date.isoformat()} to {max_date}"
+        body = f"""
+        <html><body style='font-family:sans-serif;font-size:14px;color:#222'>
+        <p><strong>Records imported: {upserted:,}</strong></p>
+        {section(f"This Import ({start_date.isoformat()} to {max_date})", this_import, this_import_pages, this_import_clicks)}
+        <br>
+        {section(f"This Month ({month_start.strftime('%B %Y')})", month, month_pages, month_clicks)}
+        <br>
+        {section(f"All Time ({alltime_row[2]} to {alltime_row[3]})", alltime_row, alltime_pages, alltime_clicks)}
+        <br>
+        <h3 style='margin-bottom:8px'>Usage Trend</h3>
+        <img src="cid:trend_chart" style="max-width:100%;border:1px solid #eee;border-radius:4px">
+        </body></html>
+        """
+
+        print(f"Start date: {start_date.isoformat()}")
+        print(f"Rows from GoatCounter payload: {len(rows)}")
+        print(f"Rows upserted into goatcounter_daily_hits: {upserted}")
+        print(f"Total rows in goatcounter_daily_hits: {total_rows}")
+        print(f"Latest date in table: {max_date}")
+        send_notification(subject=subject, body=body, chart_png=chart_b64)
+    except Exception as exc:
+        log_run(con, this_week_start, "failure", str(exc))
+        con.close()
+        send_notification(subject=f"webstats ingest: FAILED {datetime.now(timezone.utc).date()}", body=f"<pre>{exc}</pre>")
+        raise
 
 
 if __name__ == "__main__":

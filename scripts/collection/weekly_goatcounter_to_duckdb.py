@@ -185,7 +185,7 @@ def upsert_daily_hits(con: duckdb.DuckDBPyConnection, df: pd.DataFrame) -> int:
     return len(df)
 
 
-SITE_LAUNCH_DATE = date(2026, 4, 24)
+SITE_LAUNCH_DATE = date(2026, 4, 15)
 
 
 def build_trend_chart(con: duckdb.DuckDBPyConnection) -> bytes:
@@ -305,18 +305,28 @@ def main() -> None:
             ).fetchall()
             return summary, pages, clicks
 
-        # This import metrics
-        this_import, this_import_pages, this_import_clicks = query_metrics(con, "date >= ?", [start_date])
+        # Previous full week (Mon–Sun)
+        today = datetime.now(timezone.utc).date()
+        this_week_mon = today - timedelta(days=today.weekday())
+        last_week_mon = this_week_mon - timedelta(days=7)
+        last_week_sun = this_week_mon - timedelta(days=1)
 
-        # Month metrics
-        month_start = max_date.replace(day=1)
-        month, month_pages, month_clicks = query_metrics(con, "date >= ?", [month_start])
+        last_week, last_week_pages, last_week_clicks = query_metrics(
+            con, "date >= ? AND date <= ?", [last_week_mon, last_week_sun]
+        )
 
-        # All time metrics
+        # Current month
+        month_start = today.replace(day=1)
+        month, month_pages, month_clicks = query_metrics(
+            con, "date >= ?", [month_start]
+        )
+
+        # All time (from site launch)
         alltime_row = con.execute(
-            "SELECT SUM(hits), COUNT(DISTINCT url), MIN(date), MAX(date) FROM goatcounter_daily_hits WHERE event = FALSE"
+            "SELECT SUM(hits), COUNT(DISTINCT url), MIN(date), MAX(date) FROM goatcounter_daily_hits WHERE event = FALSE AND date >= ?",
+            [SITE_LAUNCH_DATE],
         ).fetchone()
-        _, alltime_pages, alltime_clicks = query_metrics(con, "TRUE", [])
+        _, alltime_pages, alltime_clicks = query_metrics(con, "date >= ?", [SITE_LAUNCH_DATE])
 
         chart_b64 = build_trend_chart(con)
 
@@ -360,11 +370,11 @@ def main() -> None:
         body = f"""
         <html><body style='font-family:sans-serif;font-size:14px;color:#222'>
         <p><strong>Records imported: {upserted:,}</strong></p>
-        {section(f"This Import ({start_date.isoformat()} to {max_date})", this_import, this_import_pages, this_import_clicks)}
+        {section(f"Last Week ({last_week_mon.strftime('%b %d')} – {last_week_sun.strftime('%b %d')})", last_week, last_week_pages, last_week_clicks)}
         <br>
         {section(f"This Month ({month_start.strftime('%B %Y')})", month, month_pages, month_clicks)}
         <br>
-        {section(f"All Time ({alltime_row[2]} to {alltime_row[3]})", alltime_row, alltime_pages, alltime_clicks)}
+        {section(f"All Time (since {SITE_LAUNCH_DATE.strftime('%b %d, %Y')})", alltime_row, alltime_pages, alltime_clicks)}
         <br>
         <h3 style='margin-bottom:8px'>Usage Trend</h3>
         <img src="cid:trend_chart" style="max-width:100%;border:1px solid #eee;border-radius:4px">

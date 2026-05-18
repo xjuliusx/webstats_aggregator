@@ -1,1 +1,1 @@
-0 8 * * * cd /Users/juliuskim/code/webstats_aggregator && source .env && /usr/bin/python3 scripts/collection/weekly_goatcounter_to_duckdb.py --once-per-week >> output/weekly_ingest.log 2>&1
+0 8 * * * sleep 30 && cd /Users/juliuskim/code/webstats_aggregator && . ./.env && /usr/bin/python3 scripts/collection/weekly_goatcounter_to_duckdb.py --once-per-week >> output/weekly_ingest.log 2>&1
